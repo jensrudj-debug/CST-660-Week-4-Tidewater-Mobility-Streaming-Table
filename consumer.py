@@ -10,8 +10,16 @@ stream, and counts trips per zone in tumbling 15-minute windows two ways:
 Events that arrive after their event-time window has closed are routed to a
 late_events side output instead of being dropped.
 
+At the end of every batch the results are appended to Delta Lake tables under
+lake/: trips_raw, zone_counts_event_time, zone_counts_processing_time and
+late_events. Appends use schema merging, so the surge_multiplier column that
+appears on day 4 is added to the tables instead of failing the write.
+
 Progress is saved to a checkpoint after every batch, so a run stopped with
---through-day can be resumed by running the script again.
+--through-day can be resumed by running the script again. Writes are
+idempotent: if a run crashes partway through writing a batch, the next run
+replays that batch and each table skips it if it already has it, so no rows
+are duplicated (see "Idempotent writes" below).
 
 Usage:
     python consumer.py --through-day 3   # process the stream up to the end of day 3
@@ -26,6 +34,9 @@ from datetime import datetime, timedelta
 from itertools import islice
 from pathlib import Path
 
+import pyarrow as pa
+from deltalake import CommitProperties, DeltaTable, Transaction, write_deltalake
+
 from generator import OUTPUT_PATH as EVENTS_PATH, START_DATE
 
 # ---------------------------------------------------------------------------
@@ -35,8 +46,14 @@ BATCH_SIZE = 500
 WINDOW_SIZE = timedelta(minutes=15)
 WATERMARK_DELAY = timedelta(minutes=2)
 ALLOWED_LATENESS = timedelta(minutes=10)
-CHECKPOINT_PATH = Path("lake/_checkpoints/consumer_state.json")
+LAKE_DIR = Path("lake")
+CHECKPOINT_PATH = LAKE_DIR / "_checkpoints" / "consumer_state.json"
 MAX_LATE_EXAMPLES = 5  # late events printed per batch
+
+TRIPS_RAW_TABLE = LAKE_DIR / "trips_raw"
+EVENT_COUNTS_TABLE = LAKE_DIR / "zone_counts_event_time"
+PROCESSING_COUNTS_TABLE = LAKE_DIR / "zone_counts_processing_time"
+LATE_EVENTS_TABLE = LAKE_DIR / "late_events"
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +128,9 @@ class State:
         self.event_windows = Counter()
         self.processing_windows = Counter()
         self.total_late = 0
+        # Set while a batch is being written: the offset that batch ends at.
+        # If the run crashes mid-write, the next run replays exactly that range.
+        self.pending_end_offset = None
 
     @property
     def watermark(self):
@@ -130,6 +150,7 @@ class State:
             "event_windows": windows(self.event_windows),
             "processing_windows": windows(self.processing_windows),
             "total_late": self.total_late,
+            "pending_end_offset": self.pending_end_offset,
         }
 
     @classmethod
@@ -145,6 +166,7 @@ class State:
         state.event_windows = windows(data["event_windows"])
         state.processing_windows = windows(data["processing_windows"])
         state.total_late = data["total_late"]
+        state.pending_end_offset = data["pending_end_offset"]
         return state
 
 
@@ -228,23 +250,122 @@ def process_batch(state: State, events: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# Writing to Delta Lake
+# ---------------------------------------------------------------------------
+TIMESTAMP = pa.timestamp("us", tz="UTC")
+EVENT_FIELDS = [
+    pa.field("trip_id", pa.string()),
+    pa.field("zone", pa.string()),
+    pa.field("event_time", TIMESTAMP),
+    pa.field("processing_time", TIMESTAMP),
+    pa.field("fare", pa.float64()),
+]
+SURGE_FIELD = pa.field("surge_multiplier", pa.float64())
+LATE_FIELDS = EVENT_FIELDS + [
+    pa.field("window_start", TIMESTAMP),
+    pa.field("window_end", TIMESTAMP),
+    pa.field("watermark", TIMESTAMP),
+    pa.field("lateness_seconds", pa.float64()),
+]
+WINDOW_SCHEMA = pa.schema([
+    pa.field("zone", pa.string()),
+    pa.field("window_start", TIMESTAMP),
+    pa.field("trip_count", pa.int64()),
+    pa.field("batch_id", pa.int64()),
+])
+
+
+def events_to_arrow(rows: list[dict], fields: list[pa.Field], batch_id: int) -> pa.Table:
+    """Build an Arrow table from event dicts.
+
+    surge_multiplier is only included when at least one row has it, so the
+    tables start without the column and gain it when day 4 arrives. Rows in
+    the same batch that lack the key (e.g. late day-3 events) get null.
+    """
+    if any(SURGE_FIELD.name in row for row in rows):
+        fields = fields + [SURGE_FIELD]
+    columns = {}
+    for field in fields:
+        values = [row.get(field.name) for row in rows]
+        if field.type == TIMESTAMP:
+            values = [parse_ts(v) for v in values]
+        columns[field.name] = pa.array(values, type=field.type)
+    columns["batch_id"] = pa.array([batch_id] * len(rows), type=pa.int64())
+    return pa.table(columns)
+
+
+def windows_to_arrow(closed: list, batch_id: int) -> pa.Table:
+    return pa.table({
+        "zone": [zone for _, zone, _ in closed],
+        "window_start": [start for start, _, _ in closed],
+        "trip_count": [n for _, _, n in closed],
+        "batch_id": [batch_id] * len(closed),
+    }, schema=WINDOW_SCHEMA)
+
+
+# Idempotent writes
+# -----------------
+# Each append is tagged with a Delta "application transaction": the pair
+# (APP_ID, batch_id) is stored in the same commit as the data, so either both
+# land or neither does. Before appending, we ask the table which batch_id it
+# last committed for APP_ID. If it already has this batch, the append is
+# skipped. Replaying a batch after a crash therefore never duplicates rows,
+# even if the crash happened after some tables were written and not others.
+APP_ID = "tidewater-consumer"
+
+
+def append(table_path: Path, data: pa.Table, batch_id: int) -> bool:
+    """Append data as batch_id. Returns False if the table already had it."""
+    if not data.num_rows:
+        return True
+    uri = str(table_path)
+    if DeltaTable.is_deltatable(uri):
+        committed = DeltaTable(uri).transaction_version(APP_ID)
+        if committed is not None and committed >= batch_id:
+            return False
+    # schema_mode="merge" lets an append add new columns (surge_multiplier)
+    # to the table schema. Older rows read back as null for the new column.
+    write_deltalake(
+        uri, data, mode="append", schema_mode="merge",
+        commit_properties=CommitProperties(app_transactions=[Transaction(APP_ID, batch_id)]),
+    )
+    return True
+
+
+def write_batch(batch_id, events, closed_event, closed_processing, late_events) -> None:
+    writes = [
+        (TRIPS_RAW_TABLE, events_to_arrow(events, EVENT_FIELDS, batch_id)),
+        (EVENT_COUNTS_TABLE, windows_to_arrow(closed_event, batch_id)),
+        (PROCESSING_COUNTS_TABLE, windows_to_arrow(closed_processing, batch_id)),
+        (LATE_EVENTS_TABLE, events_to_arrow(late_events, LATE_FIELDS, batch_id)),
+    ]
+    for table_path, data in writes:
+        if not append(table_path, data, batch_id):
+            print(f"  {table_path.name}: batch {batch_id} already committed, skipped")
+
+
+# ---------------------------------------------------------------------------
 # Reading the stream
 # ---------------------------------------------------------------------------
-def read_batches(state: State, stop_at: datetime | None):
-    """Yield lists of up to BATCH_SIZE events, starting after state.offset.
+def read_batches(start_offset: int, stop_at: datetime | None, replay_end: int | None):
+    """Yield lists of up to BATCH_SIZE events, starting after start_offset.
 
     Stops before the first event whose processing_time is at or after stop_at,
     so a resumed run picks up exactly where this one left off.
+
+    If replay_end is set, the first batch is exactly the lines up to
+    replay_end, ignoring stop_at: it is a batch an earlier run started writing,
+    and it must be rebuilt with the same boundaries to match what was written.
     """
     with open(EVENTS_PATH, encoding="utf-8") as f:
-        lines = islice(f, state.offset, None)
         batch = []
-        for line in lines:
+        for line_number, line in enumerate(islice(f, start_offset, None), start=start_offset + 1):
             event = json.loads(line)
-            if stop_at is not None and parse_ts(event["processing_time"]) >= stop_at:
+            replaying = replay_end is not None and line_number <= replay_end
+            if not replaying and stop_at is not None and parse_ts(event["processing_time"]) >= stop_at:
                 break
             batch.append(event)
-            if len(batch) == BATCH_SIZE:
+            if len(batch) == BATCH_SIZE or (replaying and line_number == replay_end):
                 yield batch
                 batch = []
         if batch:
@@ -311,15 +432,31 @@ def main() -> None:
     print(f"Window {WINDOW_SIZE}, watermark delay {WATERMARK_DELAY}, allowed lateness {ALLOWED_LATENESS}")
     if state.offset:
         print(f"Resuming from line {state.offset + 1} (batch {state.batch_number + 1})")
+    if state.pending_end_offset is not None:
+        print(f"Previous run stopped while writing batch {state.batch_number + 1}; "
+              f"replaying lines {state.offset + 1}-{state.pending_end_offset}")
     if stop_at:
         print(f"Stopping before processing_time {fmt_ts(stop_at)} (end of day {args.through_day})")
 
     batches_run = 0
-    for events in read_batches(state, stop_at):
+    for events in read_batches(state.offset, stop_at, state.pending_end_offset):
+        # 1. Record which lines this batch covers before writing anything, so a
+        #    crash during the writes can be replayed with the same boundaries.
+        state.pending_end_offset = state.offset + len(events)
+        save_state(state)
+
+        # 2. Process the batch. This is deterministic: the same starting state
+        #    and the same lines always produce the same results.
         state.offset += len(events)
         state.batch_number += 1
         closed_event, closed_processing, late_events = process_batch(state, events)
         print_batch_summary(state, events, closed_event, closed_processing, late_events)
+
+        # 3. Write the tables. Tables that already have this batch skip it.
+        write_batch(state.batch_number, events, closed_event, closed_processing, late_events)
+
+        # 4. Mark the batch complete.
+        state.pending_end_offset = None
         save_state(state)
         batches_run += 1
 
