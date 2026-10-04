@@ -339,9 +339,14 @@ def write_batch(batch_id, events, closed_event, closed_processing, late_events) 
         (PROCESSING_COUNTS_TABLE, windows_to_arrow(closed_processing, batch_id)),
         (LATE_EVENTS_TABLE, events_to_arrow(late_events, LATE_FIELDS, batch_id)),
     ]
+    written = []
     for table_path, data in writes:
-        if not append(table_path, data, batch_id):
+        if append(table_path, data, batch_id):
+            written.append(f"{table_path.name} +{data.num_rows}")
+        else:
             print(f"  {table_path.name}: batch {batch_id} already committed, skipped")
+    if written:
+        print(f"wrote to Delta: {', '.join(written)}")
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +380,7 @@ def read_batches(start_offset: int, stop_at: datetime | None, replay_end: int | 
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
-def print_batch_summary(state, events, closed_event, closed_processing, late_events):
+def print_batch_summary(state, events, closed_event, closed_processing, late_events, late_examples):
     first_line = state.offset - len(events) + 1
     print(f"\n=== Batch {state.batch_number}: lines {first_line}-{state.offset} ===")
     print(f"processing_time {fmt_ts(parse_ts(events[0]['processing_time']))} -> "
@@ -407,12 +412,14 @@ def print_batch_summary(state, events, closed_event, closed_processing, late_eve
     late_by_zone = Counter(e["zone"] for e in late_events)
     zones = ", ".join(f"{z} {n}" for z, n in late_by_zone.most_common()) or "-"
     print(f"late events -> side output: {len(late_events)}  ({zones})")
-    for e in late_events[:MAX_LATE_EXAMPLES]:
+    for e in late_events[:late_examples]:
+        delay = parse_ts(e["processing_time"]) - parse_ts(e["event_time"])
+        hours, minutes = divmod(round(delay.total_seconds() / 60), 60)
         print(f"  {e['zone']:<14} event_time {fmt_ts(parse_ts(e['event_time']))}  "
               f"arrived {fmt_ts(parse_ts(e['processing_time']))}  "
-              f"lateness {e['lateness_seconds']:>9.0f}s")
-    if len(late_events) > MAX_LATE_EXAMPLES:
-        print(f"  ... and {len(late_events) - MAX_LATE_EXAMPLES} more")
+              f"delay {hours:>2}h{minutes:02d}m  lateness {e['lateness_seconds']:>7.0f}s")
+    if len(late_events) > late_examples:
+        print(f"  ... and {len(late_events) - late_examples} more")
 
 
 def main() -> None:
@@ -420,6 +427,8 @@ def main() -> None:
     parser.add_argument("--through-day", type=int, metavar="N",
                         help="stop after simulated day N (by processing_time); rerun to resume")
     parser.add_argument("--reset", action="store_true", help="delete the checkpoint and start from the beginning")
+    parser.add_argument("--late-examples", type=int, default=MAX_LATE_EXAMPLES, metavar="N",
+                        help=f"late events to print per batch (default {MAX_LATE_EXAMPLES})")
     args = parser.parse_args()
 
     if args.reset and CHECKPOINT_PATH.exists():
@@ -450,7 +459,7 @@ def main() -> None:
         state.offset += len(events)
         state.batch_number += 1
         closed_event, closed_processing, late_events = process_batch(state, events)
-        print_batch_summary(state, events, closed_event, closed_processing, late_events)
+        print_batch_summary(state, events, closed_event, closed_processing, late_events, args.late_examples)
 
         # 3. Write the tables. Tables that already have this batch skip it.
         write_batch(state.batch_number, events, closed_event, closed_processing, late_events)
@@ -464,6 +473,12 @@ def main() -> None:
           f"{state.total_late} late events in total.")
     print(f"Still open: {len(state.event_windows)} event-time windows, "
           f"{len(state.processing_windows)} processing-time windows.")
+    with open(EVENTS_PATH, encoding="utf-8") as f:
+        total_lines = sum(1 for _ in f)
+    if state.offset == total_lines:
+        print(f"End of stream: all {total_lines} events processed.")
+    else:
+        print(f"{total_lines - state.offset} events not yet processed; run again without --through-day to continue.")
 
 
 if __name__ == "__main__":
