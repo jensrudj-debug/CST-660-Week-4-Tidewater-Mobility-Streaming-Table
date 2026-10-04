@@ -38,7 +38,7 @@ def run_consumer(through_day: int) -> None:
         capture_output=True, text=True, check=True,
     )
     # Only show the consumer's final summary to keep the demo readable
-    for line in result.stdout.strip().splitlines()[-2:]:
+    for line in result.stdout.strip().splitlines()[-3:]:
         print(f"  {line}")
 
 
@@ -97,13 +97,26 @@ def main() -> None:
           f"{len(files_before & files_after)} of {len(files_before)}")
     print(f"New data files added for day 4:              {len(files_after - files_before)}")
 
-    print(f"\nCommits since version {version_before}:")
-    for commit in sorted(dt.history(dt.version() - version_before), key=lambda c: c["version"]):
+    commits = sorted(dt.history(dt.version() - version_before), key=lambda c: c["version"])
+    print(f"\nCommits since version {version_before}: {len(commits)}")
+
+    def show(commit):
         metrics = commit["operationMetrics"]
-        print(f"  v{commit['version']:<3} {commit['operation']} {commit['operationParameters']['mode']:<7}"
+        print(f"  v{commit['version']:<4} {commit['operation']} {commit['operationParameters']['mode']:<7}"
               f" +{metrics['num_added_files']} files, -{metrics['num_removed_files']} files,"
               f" +{metrics['num_added_rows']} rows")
-    print("No files removed: the new column was added to the table metadata only.")
+
+    shown = commits if len(commits) <= 6 else commits[:3] + [None] + commits[-2:]
+    for commit in shown:
+        if commit is None:
+            print(f"  ... {len(commits) - 5} more appends ...")
+        else:
+            show(commit)
+    operations = {(c["operation"], c["operationParameters"]["mode"]) for c in commits}
+    removed = sum(c["operationMetrics"]["num_removed_files"] for c in commits)
+    print(f"Operations: {', '.join(f'{op} {mode}' for op, mode in sorted(operations))}; "
+          f"files removed across all {len(commits)} commits: {removed}")
+    print("The new column was added to the table metadata only; no data files were rewritten.")
 
     # ------------------------------------------------------------------
     banner("STEP 3: old rows read surge_multiplier as NULL, with no rewrite")
