@@ -1,0 +1,13 @@
+# Virtual environment
+.venv/
+venv/
+
+# Generated event stream
+events.jsonl
+
+# Local Delta Lake tables
+lake/
+
+# Python cache
+__pycache__/
+*.pyc
